@@ -1,176 +1,200 @@
-"""
-app.py
-เว็บแอป Streamlit สำหรับโหลดโมเดลที่ฝึกไว้ (.pkl) แล้วให้ผู้ใช้กรอกค่าฟีเจอร์
-เพื่อทำนายผล (ตัวอย่างนี้ตั้งชื่อหัวข้อว่า "จำแนกโรค COVID")
-
-หมายเหตุสำคัญ: โค้ดนี้ไม่สามารถเชื่อมต่อไปดึงไฟล์จาก Google Drive ของคุณ
-โดยอัตโนมัติ (ไม่มีสิทธิ์เข้าถึงลิงก์ที่แชร์มา) ดังนั้นให้ทำอย่างใดอย่างหนึ่ง:
-  1) ดาวน์โหลดโฟลเดอร์ "models" จาก Google Drive มาไว้ในเครื่อง/เซิร์ฟเวอร์
-     เดียวกับไฟล์ app.py นี้ (จะสร้างโฟลเดอร์ชื่อ "models" ให้อัตโนมัติถ้ายังไม่มี)
-  2) หรือใช้ปุ่มอัปโหลดไฟล์ .pkl ในแอปแทนก็ได้ (มีให้เลือกในแอปนี้)
-"""
+# app.py
+# -*- coding: utf-8 -*-
+# ==================================================================
+#  โปรแกรมจำแนกโรค Covid-19 จากภาพ X-ray (Streamlit)
+# ------------------------------------------------------------------
+#  โมเดล (*.pkcls) เป็นโมเดลของ "Orange Data Mining"
+#  ที่เทรนบน "image embedding" ขนาด 2048 มิติ ซึ่งได้จากโมเดล
+#  Inception v3 (วิดเจ็ต Image Embedding ของ Orange)
+#
+#  ลำดับการทำงาน:
+#    ผู้ใช้อัปโหลดภาพ X-ray  ->  ฝังภาพเป็นเวกเตอร์ 2048 ค่า
+#    ->  ส่งเข้าโมเดล Orange ที่เลือก  ->  ทำนายเป็น covid / normal / pneumonia
+# ==================================================================
 
 import os
-import glob
-import joblib
-import pandas as pd
-import streamlit as st
+# ตั้งค่าให้ Qt ทำงานแบบไม่ต้องมีจอ (จำเป็นเมื่อรันบนเซิร์ฟเวอร์/คลาวด์)
+# ต้องตั้งค่า "ก่อน" import ส่วนที่เกี่ยวกับ Orange image embedder
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-# ---------------------------------------------------------------
-# 1) ตั้งค่าหน้าเว็บและหัวข้อ
-# ---------------------------------------------------------------
-st.set_page_config(page_title="จำแนกโรค COVID", page_icon="🩺", layout="centered")
-st.title("โปรแกรมจำแนกโรค covid จากภาพ X-ray")
+import glob                  # ใช้ค้นหาไฟล์ตามรูปแบบ *.pkcls
+import tempfile              # ใช้สร้างไฟล์ภาพชั่วคราวสำหรับส่งให้ตัวฝังภาพ
+import joblib                # ใช้โหลดโมเดลที่บันทึกไว้
+import numpy as np           # ใช้จัดการเวกเตอร์ตัวเลข
+import streamlit as st       # ไลบรารีสร้างเว็บแอป
 
-# โฟลเดอร์ที่เก็บไฟล์โมเดล (.pkl) ทั้งหมด - ให้วางไฟล์ที่ดาวน์โหลดจาก
-# Google Drive โฟลเดอร์ "models" ไว้ในโฟลเดอร์นี้
-MODEL_DIR = "models"
-os.makedirs(MODEL_DIR, exist_ok=True)
+# --- ส่วนของ Orange ---
+from Orange.data import Table, Domain   # ใช้สร้างตารางข้อมูลรูปแบบ Orange
+# ตัวฝังภาพ (image embedder) ของ Orange ที่ให้เวกเตอร์ 2048 ค่าแบบ Inception v3
+from orangecontrib.imageanalytics.image_embedder import ImageEmbedder
+
+# ------------------------------------------------------------------
+#  ค่าคงที่ของแอป
+# ------------------------------------------------------------------
+MODELS_DIR = "Models"          # โฟลเดอร์ที่เก็บไฟล์ *.pkcls (วางข้างไฟล์ app.py นี้)
+EMBEDDER_MODEL = "inception-v3"  # ตัวฝังภาพ ต้องตรงกับที่ใช้ตอนเทรนใน Orange
+
+# แปลงชื่อคลาส (ภาษาอังกฤษของโมเดล) เป็นภาษาไทยเพื่อให้อ่านง่าย
+LABEL_TH = {
+    "covid": "ติดเชื้อโควิด-19",
+    "normal": "ปกติ",
+    "pneumonia": "ปอดอักเสบ (Pneumonia)",
+}
 
 
-# ---------------------------------------------------------------
-# 2) ฟังก์ชันโหลดโมเดลด้วย joblib (มี cache กันโหลดซ้ำทุกครั้งที่กดปุ่ม)
-# ---------------------------------------------------------------
-@st.cache_resource
+# ------------------------------------------------------------------
+#  ฟังก์ชันช่วยเหลือ
+# ------------------------------------------------------------------
+def list_model_files(models_dir: str):
+    """คืนรายการ path ของไฟล์ *.pkcls ทั้งหมดในโฟลเดอร์ที่กำหนด"""
+    return sorted(glob.glob(os.path.join(models_dir, "*.pkcls")))
+
+
+@st.cache_resource   # แคชโมเดลไว้ ไม่ต้องโหลดใหม่ทุกครั้ง
 def load_model(model_path: str):
-    """โหลดไฟล์โมเดล .pkl ด้วย joblib"""
+    """โหลดโมเดล Orange จากไฟล์ .pkcls ด้วย joblib"""
     return joblib.load(model_path)
 
 
-# ---------------------------------------------------------------
-# 3) UI สำหรับให้ผู้ใช้เลือกโมเดลเอง
-#    - แบบที่ 1: เลือกจากไฟล์ .pkl ที่อยู่ในโฟลเดอร์ models/
-#    - แบบที่ 2: อัปโหลดไฟล์ .pkl เอง (เผื่อรันบนเซิร์ฟเวอร์ที่ไม่มีไฟล์อยู่แล้ว)
-# ---------------------------------------------------------------
-st.sidebar.header("⚙️ เลือกโมเดล")
+@st.cache_resource   # แคชตัวฝังภาพไว้ใช้ซ้ำ (สร้างครั้งเดียว)
+def get_embedder():
+    """สร้างตัวฝังภาพ Inception v3 (ต้องเชื่อมต่ออินเทอร์เน็ตเพื่อเรียกเซิร์ฟเวอร์ฝังภาพของ Orange)"""
+    return ImageEmbedder(model=EMBEDDER_MODEL)
 
-model_files = sorted(glob.glob(os.path.join(MODEL_DIR, "*.pkl")))
-model_source = st.sidebar.radio(
-    "แหล่งที่มาของไฟล์โมเดล",
-    ["เลือกจากโฟลเดอร์ models/", "อัปโหลดไฟล์ .pkl เอง"],
+
+def embed_image(image_path: str):
+    """
+    แปลงไฟล์ภาพ 1 รูป ให้เป็นเวกเตอร์ตัวเลข 2048 ค่า (image embedding)
+    คืนค่าเป็น numpy array รูปร่าง (1, 2048) หรือ None ถ้าฝังภาพไม่สำเร็จ
+    """
+    embedder = get_embedder()
+    # ImageEmbedder รับ "ลิสต์ของ path" และคืน "ลิสต์ของเวกเตอร์"
+    embeddings = embedder([image_path])
+    vec = embeddings[0]                       # เอาผลของภาพแรก
+    if vec is None or len(vec) == 0:          # ภาพนี้ถูกข้าม (embedding ไม่สำเร็จ)
+        return None
+    return np.asarray(vec, dtype=float).reshape(1, -1)
+
+
+def predict(model, feature_vector: np.ndarray):
+    """
+    นำเวกเตอร์ฟีเจอร์ (1, 2048) เข้าโมเดล Orange แล้วคืน (ชื่อคลาสที่ทำนาย, ตารางความน่าจะเป็น)
+    """
+    # ใช้ 'original_domain' ของโมเดล (โดเมนอินพุตดิบ n0..n2047)
+    # เพื่อให้ Orange แปลง/พรีโพรเซสภายในได้ถูกต้อง (สำคัญมากสำหรับ SVM/NN)
+    input_domain = Domain(model.original_domain.attributes)
+    table = Table.from_numpy(input_domain, feature_vector)
+
+    # ทำนายคลาส (ได้เป็นดัชนีของคลาส) แล้วแปลงเป็นชื่อคลาส
+    class_index = int(model(table)[0])
+    class_name = model.domain.class_var.values[class_index]
+
+    # ทำนายความน่าจะเป็นของแต่ละคลาส (ถ้าโมเดลรองรับ)
+    probs = None
+    try:
+        from Orange.classification import Model as OrangeModel
+        proba_row = model(table, OrangeModel.Probs)[0]     # เวกเตอร์ความน่าจะเป็น
+        probs = list(zip(model.domain.class_var.values, proba_row))
+    except Exception:
+        probs = None
+
+    return class_name, probs
+
+
+# ==================================================================
+#  ส่วนติดต่อผู้ใช้ (UI)
+# ==================================================================
+
+# --- หัวข้อแอป ---
+st.title("โปรแกรมจำแนกโรค Covid-19 จากภาพ X-ray")
+
+# --- แถบด้านข้าง: เลือกโมเดล ---
+st.sidebar.header("เลือกโมเดล")
+model_files = list_model_files(MODELS_DIR)
+
+if not model_files:
+    # ไม่พบไฟล์โมเดล -> แจ้งเตือนแล้วหยุด
+    st.error(
+        f"ไม่พบไฟล์ *.pkcls ในโฟลเดอร์ '{MODELS_DIR}' "
+        f"กรุณานำไฟล์โมเดล (เช่น W10-SVM-Model.pkcls) มาไว้ในโฟลเดอร์นี้ก่อน"
+    )
+    st.stop()
+
+# ให้ผู้ใช้เลือกไฟล์โมเดลเอง (แสดงเฉพาะชื่อไฟล์)
+selected_model_path = st.sidebar.selectbox(
+    "ไฟล์โมเดล (*.pkcls)",
+    options=model_files,
+    format_func=lambda p: os.path.basename(p),
 )
 
-model = None
-model_name_display = None
+# โหลดโมเดลที่เลือก
+model = load_model(selected_model_path)
+st.sidebar.success(f"โหลดโมเดลสำเร็จ: {os.path.basename(selected_model_path)}")
+# แสดงชื่อคลาสที่โมเดลจำแนกได้
+st.sidebar.caption("คลาสที่ทำนายได้: " + ", ".join(model.domain.class_var.values))
 
-if model_source == "เลือกจากโฟลเดอร์ models/":
-    if not model_files:
-        st.sidebar.warning(
-            "ยังไม่พบไฟล์ .pkl ในโฟลเดอร์ 'models/' "
-            "กรุณาดาวน์โหลดไฟล์จาก Google Drive มาวางไว้ในโฟลเดอร์นี้ "
-            "หรือเปลี่ยนไปใช้วิธี 'อัปโหลดไฟล์ .pkl เอง' แทน"
-        )
-    else:
-        selected_path = st.sidebar.selectbox("เลือกไฟล์โมเดล", model_files)
-        model = load_model(selected_path)
-        model_name_display = os.path.basename(selected_path)
-else:
-    uploaded_model = st.sidebar.file_uploader("อัปโหลดไฟล์โมเดล (.pkl)", type=["pkl"])
-    if uploaded_model is not None:
-        # บันทึกไฟล์ที่อัปโหลดลงดิสก์ชั่วคราวก่อน แล้วค่อยโหลดด้วย joblib
-        temp_path = os.path.join(MODEL_DIR, uploaded_model.name)
-        with open(temp_path, "wb") as f:
-            f.write(uploaded_model.getbuffer())
-        model = load_model(temp_path)
-        model_name_display = uploaded_model.name
+# --- ส่วนอัปโหลดภาพ ---
+st.subheader("อัปโหลดภาพ X-ray")
+uploaded_file = st.file_uploader(
+    "เลือกไฟล์ภาพ (.png, .jpg, .jpeg)",
+    type=["png", "jpg", "jpeg"],
+)
 
-if model_name_display:
-    st.sidebar.success(f"โหลดโมเดล '{model_name_display}' สำเร็จแล้ว ✅")
+# แสดงตัวอย่างภาพที่อัปโหลด
+if uploaded_file is not None:
+    # หมายเหตุ: streamlit 1.38.0 ใช้ use_column_width (ไม่ใช่ use_container_width)
+    st.image(uploaded_file, caption="ภาพที่อัปโหลด", use_column_width=True)
 
-
-# ---------------------------------------------------------------
-# 4) ช่องกรอกค่าฟีเจอร์ (features)
-#    *** จุดที่ต้องแก้ไขให้ตรงกับข้อมูลที่ใช้ฝึกโมเดลของคุณจริง ๆ ***
-#    ตัวอย่างด้านล่างสมมติว่าฝึกโมเดลจากข้อมูลอาการ/ข้อมูลผู้ป่วยเบื้องต้น
-#    เปลี่ยนชื่อคอลัมน์ ประเภทข้อมูล และค่าที่เลือกได้ ให้ตรงกับ dataset จริง
-# ---------------------------------------------------------------
-st.header("📋 กรอกข้อมูลเพื่อทำนาย")
-
-# ตัวแปรตัวเลข (numeric) -> ใช้ st.number_input
-age = st.number_input("อายุ (ปี)", min_value=0, max_value=120, value=30, step=1)
-temperature = st.number_input("อุณหภูมิร่างกาย (°C)", min_value=30.0, max_value=45.0, value=36.5, step=0.1)
-spo2 = st.number_input("ค่าออกซิเจนในเลือด SpO2 (%)", min_value=0, max_value=100, value=98, step=1)
-
-# ตัวแปรหมวดหมู่ (categorical) -> ใช้ st.selectbox
-gender = st.selectbox("เพศ", ["ชาย", "หญิง"])
-cough = st.selectbox("มีอาการไอหรือไม่", ["มี", "ไม่มี"])
-fever = st.selectbox("มีอาการไข้หรือไม่", ["มี", "ไม่มี"])
-
-# รวมค่าที่กรอกทั้งหมดไว้ในรูปแบบ dict ก่อน แล้วค่อยแปลงเป็น DataFrame
-input_dict = {
-    "age": [age],
-    "temperature": [temperature],
-    "spo2": [spo2],
-    "gender": [gender],
-    "cough": [cough],
-    "fever": [fever],
-}
-input_df = pd.DataFrame(input_dict)
-
-st.write("ข้อมูลที่กรอก:")
-st.dataframe(input_df, use_container_width=True)
-
-
-# ---------------------------------------------------------------
-# 5) ฟังก์ชันแปลงข้อมูล (preprocessing) ให้ตรงกับตอนฝึกโมเดล
-#    *** สำคัญมาก: ต้องแก้ไขให้ตรงกับขั้นตอนที่ใช้ตอนฝึกโมเดลจริง ***
-#    ตัวอย่างนี้ใช้ one-hot encoding ผ่าน pd.get_dummies แล้วจัดคอลัมน์
-#    ให้ตรงกับตอน fit โมเดล (เรียงลำดับคอลัมน์ให้เหมือนกันทุกประการ)
-# ---------------------------------------------------------------
-def preprocess(df: pd.DataFrame, trained_model) -> pd.DataFrame:
-    """แปลงข้อมูลดิบจากฟอร์มให้อยู่ในรูปแบบเดียวกับตอนฝึกโมเดล"""
-
-    # one-hot encode คอลัมน์ข้อความ (categorical) เหมือนตอนฝึก
-    df_encoded = pd.get_dummies(df, columns=["gender", "cough", "fever"])
-
-    # ถ้าโมเดล (เช่น จาก scikit-learn) มีการบันทึกชื่อคอลัมน์ตอนฝึกไว้
-    # (attribute feature_names_in_) ให้ใช้ reindex เพื่อจัดคอลัมน์ให้ตรงกัน
-    # เติมคอลัมน์ที่ขาดด้วยค่า 0 และตัดคอลัมน์ที่เกินทิ้ง
-    if hasattr(trained_model, "feature_names_in_"):
-        df_encoded = df_encoded.reindex(
-            columns=trained_model.feature_names_in_, fill_value=0
-        )
-    else:
-        # ถ้าโมเดลไม่มี feature_names_in_ ให้กำหนดรายชื่อคอลัมน์ตอนฝึก
-        # ไว้เองตรงนี้ (แก้ไขรายการนี้ให้ตรงกับตอน fit จริง)
-        expected_columns = [
-            "age", "temperature", "spo2",
-            "gender_ชาย", "gender_หญิง",
-            "cough_มี", "cough_ไม่มี",
-            "fever_มี", "fever_ไม่มี",
-        ]
-        df_encoded = df_encoded.reindex(columns=expected_columns, fill_value=0)
-
-    return df_encoded
-
-
-# ---------------------------------------------------------------
-# 6) ปุ่มทำนายผล
-# ---------------------------------------------------------------
+# --- ปุ่มทำนายผล ---
 if st.button("ทำนายผล"):
-    if model is None:
-        st.error("กรุณาเลือกหรืออัปโหลดไฟล์โมเดลก่อนกดทำนายผล")
+    if uploaded_file is None:
+        st.warning("กรุณาอัปโหลดภาพ X-ray ก่อนกดทำนายผล")
     else:
+        # 1) บันทึกภาพลงไฟล์ชั่วคราว (ตัวฝังภาพต้องอ่านจาก path ของไฟล์)
+        suffix = os.path.splitext(uploaded_file.name)[1] or ".png"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(uploaded_file.getbuffer())
+            tmp_path = tmp.name
+
         try:
-            # แปลงข้อมูลให้ตรงรูปแบบตอนฝึก
-            X_input = preprocess(input_df, model)
+            # 2) ฝังภาพเป็นเวกเตอร์ 2048 ค่า
+            with st.spinner("กำลังประมวลผลภาพ (ฝังภาพด้วย Inception v3)..."):
+                feature_vector = embed_image(tmp_path)
 
-            # ทำนายผล
-            prediction = model.predict(X_input)[0]
-
-            # ถ้าโมเดลรองรับ predict_proba ให้แสดงค่าความมั่นใจด้วย
-            proba_text = ""
-            if hasattr(model, "predict_proba"):
-                proba = model.predict_proba(X_input)[0]
-                max_proba = max(proba) * 100
-                proba_text = f" (ความมั่นใจประมาณ {max_proba:.2f}%)"
-
-            # แสดงผลลัพธ์ให้อ่านง่าย
-            # *** แก้ label ให้ตรงกับค่าที่โมเดลของคุณทำนายออกมาจริง เช่น 0/1 หรือชื่อ class ***
-            if str(prediction) in ["1", "positive", "Positive", "COVID", "covid"]:
-                st.error(f"ผลการทำนาย: มีความเสี่ยงเป็น COVID{proba_text} ⚠️")
+            if feature_vector is None:
+                st.error("ไม่สามารถฝังภาพนี้ได้ กรุณาลองภาพอื่น")
             else:
-                st.success(f"ผลการทำนาย: ไม่พบความเสี่ยงเป็น COVID{proba_text} ✅")
+                # 3) ส่งเวกเตอร์เข้าโมเดลเพื่อทำนาย
+                class_name, probs = predict(model, feature_vector)
+
+                # 4) แสดงผลลัพธ์ให้อ่านง่าย
+                label_th = LABEL_TH.get(class_name, class_name)
+                st.success(f"ผลการทำนาย: {label_th}  (คลาส: {class_name})")
+
+                # แสดงตารางความน่าจะเป็นของแต่ละคลาส (ถ้ามี)
+                if probs is not None:
+                    import pandas as pd
+                    proba_df = pd.DataFrame(
+                        [
+                            {
+                                "คลาส": LABEL_TH.get(name, name),
+                                "ความน่าจะเป็น": f"{p*100:.2f}%",
+                            }
+                            for name, p in probs
+                        ]
+                    )
+                    st.write("ความน่าจะเป็นของแต่ละคลาส:")
+                    st.dataframe(proba_df, hide_index=True, use_container_width=True)
 
         except Exception as e:
-            st.error(f"เกิดข้อผิดพลาดระหว่างทำนายผล: {e}")
+            # ข้อผิดพลาดที่พบบ่อยคือ ต่ออินเทอร์เน็ตไม่ได้ (เซิร์ฟเวอร์ฝังภาพของ Orange)
+            st.error(f"เกิดข้อผิดพลาด: {e}")
+            st.info(
+                "การฝังภาพต้องเชื่อมต่ออินเทอร์เน็ต (เรียกเซิร์ฟเวอร์ของ Orange) "
+                "กรุณาตรวจสอบการเชื่อมต่อ แล้วลองใหม่อีกครั้ง"
+            )
+        finally:
+            # ลบไฟล์ชั่วคราวทิ้ง
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
